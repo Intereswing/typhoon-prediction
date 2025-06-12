@@ -128,7 +128,7 @@ class TyphoonTrajectoryDataset(Dataset):
                     msl = (msl - self.msl_mean) / self.msl_std
                     return (trajectory[:self.lookback], trajectory[self.lookback:],
                             msl[:self.lookback], msl[self.lookback:])
-
+        return None
 
     def get_mean_std(self):
         all_data = []
@@ -281,6 +281,6 @@ class TyphoonTrajectoryDataset(Dataset):
 if __name__ == "__main__":
     ds_dir = "/data/jiyilun/typhoon/download"
     # calculate mean and std
-    ds = TyphoonTrajectoryDataset(ds_dir, 2011, 2022, lookback=8, horizon=12, with_era5=True)
+    ds = TyphoonTrajectoryDataset(ds_dir, 2022, 2022, lookback=8, horizon=12, with_era5=True)
     ds.download_era5()
 

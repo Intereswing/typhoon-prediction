@@ -62,6 +62,14 @@ def preprocess_and_pad_era5(era5_0: xr.Dataset, era5_1: xr.Dataset, var_name: st
     return torch.tensor(var_pad)
 
 
+def preprocess_era5(era5_0: xr.Dataset, era5_1: xr.Dataset, var_name: str) -> torch.Tensor:
+    var_0 = era5_0[var_name].values[None, None] # [C, 721, 1440] -> [1, 1, C, 721, 1440]
+    var_1 = era5_1[var_name].values[None, None] # [C, 721, 1440] -> [1, 1, C, 721, 1440]
+    var = np.concatenate([var_0, var_1], axis=1) # [1, 2, C, 721, 1440]
+
+    return torch.from_numpy(var)
+
+
 def preprocess_hres_t0(hres_0: xr.Dataset, hres_1: xr.Dataset, var_name: str) -> torch.Tensor:
 
     var_0 = hres_0[var_name].values[..., ::-1, :][None, None].copy() # [C, 721, 1440] -> [1, 1, C, 721, 1440]
@@ -77,26 +85,26 @@ def get_aurora_batch_era5(data_t0, data_t_1, t0):
 
     batch = Batch(
         surf_vars={
-            "2t": preprocess_and_pad_era5(data_t_1, data_t0, "2m_temperature"),
-            "10u": preprocess_and_pad_era5(data_t_1, data_t0, "10m_u_component_of_wind"),
-            "10v": preprocess_and_pad_era5(data_t_1, data_t0, "10m_v_component_of_wind"),
-            "msl": preprocess_and_pad_era5(data_t_1, data_t0, "mean_sea_level_pressure"),
+            "2t": preprocess_era5(data_t_1, data_t0, "2m_temperature"),
+            "10u": preprocess_era5(data_t_1, data_t0, "10m_u_component_of_wind"),
+            "10v": preprocess_era5(data_t_1, data_t0, "10m_v_component_of_wind"),
+            "msl": preprocess_era5(data_t_1, data_t0, "mean_sea_level_pressure"),
         },
         atmos_vars={
-            "z": preprocess_and_pad_era5(data_t_1, data_t0, "geopotential"),
-            "u": preprocess_and_pad_era5(data_t_1, data_t0, "u_component_of_wind"),
-            "v": preprocess_and_pad_era5(data_t_1, data_t0, "v_component_of_wind"),
-            "t": preprocess_and_pad_era5(data_t_1, data_t0, "temperature"),
-            "q": preprocess_and_pad_era5(data_t_1, data_t0, "specific_humidity"),
+            "z": preprocess_era5(data_t_1, data_t0, "geopotential"),
+            "u": preprocess_era5(data_t_1, data_t0, "u_component_of_wind"),
+            "v": preprocess_era5(data_t_1, data_t0, "v_component_of_wind"),
+            "t": preprocess_era5(data_t_1, data_t0, "temperature"),
+            "q": preprocess_era5(data_t_1, data_t0, "specific_humidity"),
         },
         static_vars={
             k: torch.tensor(v) for k, v in static_vars.items()
         },
         metadata=Metadata(
-            lat=torch.linspace(90, -90, 721),
-            lon=torch.linspace(0, 360, 1440 + 1)[:-1],
+            lat=torch.from_numpy(data_t0["latitude"].values),
+            lon=torch.from_numpy(data_t0["longitude"].values),
             time=(datetime.strptime(t0, "%Y%m%d%H"),),
-            atmos_levels=tuple(int(level) for level in data_t0["geopotential"]["level"].values),
+            atmos_levels=tuple(int(level) for level in data_t0["level"].values),
         )
     )
 
