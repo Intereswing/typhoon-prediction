@@ -281,6 +281,6 @@ class TyphoonTrajectoryDataset(Dataset):
 if __name__ == "__main__":
     ds_dir = "/data/jiyilun/typhoon/download"
     # calculate mean and std
-    ds = TyphoonTrajectoryDataset(ds_dir, 2022, 2022, lookback=8, horizon=12, with_era5=True)
-    ds.download_era5()
+    ds = TyphoonTrajectoryDataset(ds_dir, 2011, 2020, lookback=8, horizon=12, with_era5=True)
+    print(len(ds))
 

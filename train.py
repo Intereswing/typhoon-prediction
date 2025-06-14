@@ -15,6 +15,7 @@ from model.model import TrajectoryTransformer, TrajectoryPredictor
 from model.aurora_finetune import AuroraForTyphoon
 from utils.helper import setup_logger
 
+
 def get_dist_info():
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -33,10 +34,16 @@ def ddp_cleanup():
 
 
 def train(local_rank):
+    if local_rank == 0:
+        print(f"Train start!")
     data_dir = "/data/jiyilun/typhoon/download"
+    checkpoints_dir = Path("checkpoints") / "aurora_finetune"
+    if local_rank ==0:
+        checkpoints_dir.mkdir(exist_ok=True, parents=True)
 
     # model and optimizer
     model = AuroraForTyphoon(obs_len=8, pred_len=12).to(local_rank)
+    model.aurora.load_checkpoint_local("checkpoints/aurora/aurora-0.25-small-pretrained.ckpt")
     for param in model.aurora.parameters():
         param.requires_grad = False
     ddp_model = DDP(model, device_ids=[local_rank])
@@ -50,15 +57,32 @@ def train(local_rank):
 
     # dataset and sampler
     train_dataset = TyphoonTrajectoryDataset(
-        data_dir, 2011, 2015, 8, 12, with_era5=True
+        data_dir, 2011, 2020, 8, 12, with_era5=True
     )
-    sampler = DistributedSampler(train_dataset)
-    dataloader = DataLoader(train_dataset, batch_size=1, sampler=sampler, collate_fn=aurora_collate_fn)
+    train_sampler = DistributedSampler(train_dataset)
+    train_dataloader = DataLoader(train_dataset, batch_size=1, sampler=train_sampler, collate_fn=aurora_collate_fn)
 
-    for epoch in range(5):
-        sampler.set_epoch(epoch)
+    val_dataset = TyphoonTrajectoryDataset(
+        data_dir, 2021, 2021, 8, 12, with_era5=True
+    )
+    val_sampler = DistributedSampler(val_dataset)
+    val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, sampler=val_sampler, collate_fn=aurora_collate_fn)
 
-        for obs_traj, gt_traj, obs_atmos in dataloader:
+    num_epoch = 10
+    step = 0
+    print_per_step = 5
+    num_step = num_epoch * len(train_dataloader)
+
+    best_val_loss = float("inf")
+    num_patience = 3
+    patience = num_patience
+    for epoch in range(num_epoch):
+        train_sampler.set_epoch(epoch)
+
+        ddp_model.train()
+        for obs_traj, gt_traj, obs_atmos in train_dataloader:
+            step += 1
+
             obs_traj, gt_traj, obs_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), obs_atmos.to(local_rank)
             pred_traj = ddp_model(obs_traj, obs_atmos)
             loss = loss_fn(pred_traj, gt_traj)
@@ -66,8 +90,39 @@ def train(local_rank):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            print(f"Batch Loss: {loss.item():.4f}")
-        print(f"[Rank {local_rank}] Epoch {epoch} Loss: {loss.item():.4f}")
+            if local_rank == 0 and step % print_per_step == 0:
+                print(f"[Epoch {epoch+1}/{num_epoch}] | step {step}/{num_step} | train loss: {loss.item()}")
+
+        ddp_model.eval()
+        total_loss = 0
+        num_samples = 0
+        with torch.no_grad:
+            for obs_traj, gt_traj, obs_atmos in val_dataloader:
+                obs_traj, gt_traj, obs_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), obs_atmos.to(local_rank)
+                pred_traj = ddp_model(obs_traj, obs_atmos)
+                loss = loss_fn(pred_traj, gt_traj)
+
+                total_loss += loss.item() * obs_traj.size(0)
+                num_samples += obs_traj.size(0)
+        val_loss = torch.tensor(total_loss).to(local_rank)
+        val_samples = torch.tensor(num_samples).to(local_rank)
+
+        dist.all_reduce(val_loss)
+        dist.all_reduce(val_samples)
+        avg_val_loss = val_loss.item() / val_samples.item()
+        if local_rank == 0:
+            print(f"[Epoch {epoch + 1}/{num_epoch}] | validate loss: {avg_val_loss}")
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience = num_patience
+                torch.save({k: v for k, v in ddp_model.module.state_dict() if not k.startswith("aurora.")}, checkpoints_dir / f"model_epoch_{epoch+1}.pt")
+                print(f"Update model checkpoint in epoch {epoch+1}.")
+            else:
+                patience -= 1
+                if patience <= 0:
+                    break
+    if local_rank == 0:
+        print(f"Train over!")
 
 
 def main():
