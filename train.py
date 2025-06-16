@@ -1,3 +1,4 @@
+import datetime
 import os
 from pathlib import Path
 
@@ -91,12 +92,12 @@ def train(local_rank):
             loss.backward()
             optimizer.step()
             if local_rank == 0 and step % print_per_step == 0:
-                print(f"[Epoch {epoch+1}/{num_epoch}] | step {step}/{num_step} | train loss: {loss.item()}")
+                print(f"{datetime.datetime.now()} | [Epoch {epoch+1}/{num_epoch}] | step {step}/{num_step} | train loss: {loss.item()}")
 
         ddp_model.eval()
         total_loss = 0
         num_samples = 0
-        with torch.no_grad:
+        with torch.no_grad(): # no_grad is a fn. Only after calling, it can return a context manager.
             for obs_traj, gt_traj, obs_atmos in val_dataloader:
                 obs_traj, gt_traj, obs_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), obs_atmos.to(local_rank)
                 pred_traj = ddp_model(obs_traj, obs_atmos)
@@ -119,6 +120,7 @@ def train(local_rank):
                 print(f"Update model checkpoint in epoch {epoch+1}.")
             else:
                 patience -= 1
+                print(f"Patience minus 1. Now {patience}.")
                 if patience <= 0:
                     break
     if local_rank == 0:
