@@ -27,13 +27,14 @@ class CNNEncoder(nn.Module):
 
 
 class AuroraForTyphoon(nn.Module):
-    def __init__(self, obs_len, pred_len, cnn_hidden=128, rnn_hidden=256):
+    def __init__(self, obs_len, pred_len, cnn_hidden=128, rnn_hidden=64):
         super().__init__()
         self.obs_len = obs_len
         self.pred_len = pred_len
         self.aurora = AuroraSmall()
-        self.cnn = CNNEncoder(in_channels=2, hidden_dim=cnn_hidden)
-        self.rnn = nn.GRU(input_size=cnn_hidden, hidden_size=rnn_hidden, batch_first=True)
+        self.cnn_encoder = CNNEncoder(in_channels=2, hidden_dim=cnn_hidden)
+        self.rnn_encoder = nn.GRU(input_size=2, hidden_size=rnn_hidden, batch_first=True)
+        self.rnn_decoder = nn.GRU(input_size=cnn_hidden + rnn_hidden, hidden_size=rnn_hidden, batch_first=True)
         self.fc_out = nn.Linear(rnn_hidden, 2)
 
     def forward(self, obs_traj, obs_atmos):
@@ -54,10 +55,12 @@ class AuroraForTyphoon(nn.Module):
             pred_z700 = pred_atmos.atmos_vars["z"][:, :, z700_index] # [B, 1, H, W]
             pred_z700_local = pred_z700[:, :, lat60_index + 1: lat0_index + 1, lon100_index: lon180_index]
             pred_atmos_select_local_list.append(torch.stack([pred_msl_local, pred_z700_local], dim=2))
-        pred_atmos_select_local = torch.cat(pred_atmos_select_local_list, dim=1) # [B, T, 2, H, W]
+        pred_atmos_select_local = torch.cat(pred_atmos_select_local_list, dim=1) # [B, T', 2, H, W]
 
-        pred_atmos_feat = self.cnn(pred_atmos_select_local) # [B, T, 128]
-        rnn_out, _ = self.rnn(pred_atmos_feat) # [B, T, 256]
+        pred_atmos_feat = self.cnn_encoder(pred_atmos_select_local) # [B, T', 128]
+        _, h_obs_traj = self.rnn_encoder(obs_traj) # [1, B, 64]
+        h_obs_traj = h_obs_traj.permute(1, 0, 2).repeat(1, self.pred_len, 1) # [B, T', 64]
+        rnn_out, _ = self.rnn_decoder(torch.cat([pred_atmos_feat, h_obs_traj], dim=-1)) # [B, T', 64]
         out = self.fc_out(rnn_out)
         return out
 
