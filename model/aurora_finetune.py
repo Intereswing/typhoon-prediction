@@ -65,6 +65,14 @@ class AuroraForTyphoon(nn.Module):
         return out
 
 
+class NeuralTracker(nn.Module):
+    def __init__(self, obs_len, pred_len):
+        traj_encoder = nn.Sequential(
+            nn.Linear(obs_len * 2, )
+        )
+
+
+
 if __name__ == "__main__":
     batch = Batch(
         surf_vars={k: torch.randn(1, 2, 721, 1440) for k in ("2t", "10u", "10v", "msl")},
@@ -76,10 +84,10 @@ if __name__ == "__main__":
             time=(datetime(2020, 6, 1, 12, 0),),
             atmos_levels=(50, 100, 150,200,250,300,400,500,600,700,850,925,1000),
         ),
-    ).to("cuda")
-    hist_traj = torch.randn(1, 8, 2).to("cuda")
+    ).to("cuda:4")
+    hist_traj = torch.randn(1, 8, 2).to("cuda:4")
 
-    model = AuroraForTyphoon(8, 12).to("cuda")
+    model = AuroraForTyphoon(8, 12).to("cuda:4")
     model.train()
     for param in model.aurora.parameters():
         param.requires_grad = False

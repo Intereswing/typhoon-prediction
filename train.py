@@ -2,6 +2,7 @@ import datetime
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,11 +11,14 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from aurora import AuroraSmall, Tracker, rollout
+from aurora.tracker import NoEyeException
 
 from data.dataset import TyphoonTrajectoryDataset, aurora_collate_fn
 from model.model import TrajectoryTransformer, TrajectoryPredictor
 from model.aurora_finetune import AuroraForTyphoon
 from utils.helper import setup_logger
+from utils.metrics import haversine_torch
 
 
 def get_dist_info():
@@ -37,7 +41,7 @@ def ddp_cleanup():
 def train(local_rank):
     if local_rank == 0:
         print(f"Train start!")
-    data_dir = "/data/jiyilun/typhoon/download"
+    data_dir = "/data1/jiyilun/typhoon"
     checkpoints_dir = Path("checkpoints") / "aurora_finetune"
     if local_rank ==0:
         checkpoints_dir.mkdir(exist_ok=True, parents=True)
@@ -58,13 +62,13 @@ def train(local_rank):
 
     # dataset and sampler
     train_dataset = TyphoonTrajectoryDataset(
-        data_dir, 2011, 2020, 8, 12, with_era5=True
+        data_dir, 2011, 2020, 8, 12, with_era5_for_aurora=True
     )
     train_sampler = DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, batch_size=1, sampler=train_sampler, collate_fn=aurora_collate_fn)
 
     val_dataset = TyphoonTrajectoryDataset(
-        data_dir, 2021, 2021, 8, 12, with_era5=True
+        data_dir, 2021, 2021, 8, 12, with_era5_for_aurora=True
     )
     val_sampler = DistributedSampler(val_dataset)
     val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, sampler=val_sampler, collate_fn=aurora_collate_fn)
@@ -77,6 +81,7 @@ def train(local_rank):
     best_val_loss = float("inf")
     num_patience = 3
     patience = num_patience
+    should_stop = torch.tensor(0).to(local_rank)
     for epoch in range(num_epoch):
         train_sampler.set_epoch(epoch)
 
@@ -107,30 +112,111 @@ def train(local_rank):
                 num_samples += obs_traj.size(0)
         val_loss = torch.tensor(total_loss).to(local_rank)
         val_samples = torch.tensor(num_samples).to(local_rank)
+        if local_rank == 0:
+            print(f"Validation loss on rank {local_rank} before all_reduce: {val_loss.item()}")
+            print(f"Validation samples on rank {local_rank} before all_reduce: {val_samples.item()}")
 
         dist.all_reduce(val_loss)
         dist.all_reduce(val_samples)
+
+        if local_rank == 0:
+            print(f"Validation loss on rank {local_rank} after all_reduce: {val_loss.item()}")
+            print(f"Validation samples on rank {local_rank} after all_reduce: {val_samples.item()}")
+
         avg_val_loss = val_loss.item() / val_samples.item()
         if local_rank == 0:
             print(f"[Epoch {epoch + 1}/{num_epoch}] | validate loss: {avg_val_loss}")
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 patience = num_patience
-                torch.save({k: v for k, v in ddp_model.module.state_dict() if not k.startswith("aurora.")}, checkpoints_dir / f"model_epoch_{epoch+1}.pt")
+                torch.save(
+                    {k: v for k, v in ddp_model.module.state_dict().items() if not k.startswith("aurora.")},
+                    checkpoints_dir / f"model_epoch_{epoch+1}.pt"
+                )
                 print(f"Update model checkpoint in epoch {epoch+1}.")
             else:
                 patience -= 1
                 print(f"Patience minus 1. Now {patience}.")
                 if patience <= 0:
-                    break
+                    should_stop[0] = 1
+
+        dist.broadcast(should_stop, src=0)
+        if should_stop.item() == 1:
+            print(f"[rank {local_rank}] Early stopping triggered.")
+            break
+
     if local_rank == 0:
         print(f"Train over!")
+
+
+def evaluate(local_rank):
+    if local_rank == 0:
+        print(f"Evaluate start!")
+    data_dir = "/data1/jiyilun/typhoon"
+    checkpoints_dir = Path("checkpoints") / "aurora_finetune"
+    checkpoint = torch.load(checkpoints_dir / "model_epoch_9.pt")
+
+    # model
+    model = AuroraSmall().to(local_rank)
+    model.load_checkpoint_local("checkpoints/aurora/aurora-0.25-small-pretrained.ckpt")
+    # model.load_state_dict(checkpoint, strict=False)
+
+    ddp_model = DDP(model, device_ids=[local_rank])
+
+    # dataset
+    test_dataset = TyphoonTrajectoryDataset(
+        data_dir, 2022, 2022, 8, 12, with_era5_for_aurora=True
+    )
+    test_sampler = DistributedSampler(test_dataset)
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, sampler=test_sampler, collate_fn=aurora_collate_fn)
+
+    # evaluate
+    ddp_model.eval()
+    FDE = torch.zeros(12).to(local_rank)
+    num_samples = torch.tensor(0).to(local_rank)
+    step = 0
+    with torch.inference_mode():
+        for obs_traj, gt_traj, obs_atmos in test_dataloader:
+            step += 1
+            obs_traj, gt_traj, obs_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), obs_atmos.to(local_rank)
+
+            # Initialize tracker
+            init = test_dataset.denorm_traj([obs_traj.cpu()])[0][0, -1]
+            init = init.numpy()
+            tracker = Tracker(init_lat=init[0], init_lon=init[1], init_time=obs_atmos.metadata.time[0])
+
+            # Tracker work.
+            try:
+                for pred_atmos in rollout(ddp_model.module, obs_atmos, gt_traj.size(1)):
+                    tracker.step(pred_atmos)
+            except NoEyeException:
+                print(f"Rank {local_rank} | {step}/{len(test_dataloader)} | NoEyeException detected.")
+                continue
+
+            # Retrieve results
+            track = tracker.results()
+            pred_traj = np.stack([track.lat[1:], track.lon[1:]], axis=1)[None] # [1, 12, 2]
+            pred_traj = torch.from_numpy(pred_traj)
+            gt_traj = test_dataset.denorm_traj([gt_traj.cpu()])[0] # [B, T, 2]
+
+            FDE += torch.sum(haversine_torch(gt_traj, pred_traj), dim=0).to(local_rank) # 在batch维度上计算和。
+            num_samples += gt_traj.size(0)
+
+    dist.all_reduce(FDE)
+    dist.all_reduce(num_samples)
+
+    if local_rank == 0:
+        FDE = FDE / num_samples
+        print(f"Final displacement error:")
+        for i in range(FDE.size(0)):
+            print(f"{(i+1)*6}h: {FDE[i].item():.2f} km.")
 
 
 def main():
     rank, local_rank, world_size = get_dist_info()
     ddp_setup(local_rank)
-    train(local_rank)
+    # train(local_rank)
+    evaluate(local_rank)
     ddp_cleanup()
 
 

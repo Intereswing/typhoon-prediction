@@ -79,8 +79,8 @@ def preprocess_hres_t0(hres_0: xr.Dataset, hres_1: xr.Dataset, var_name: str) ->
     return torch.from_numpy(var)
 
 
-def get_aurora_batch_era5(data_t0, data_t_1, t0):
-    with open("/data/jiyilun/typhoon/download/era5/aurora-0.25-static.pickle", "rb") as f:
+def get_aurora_batch_era5(data_t0, data_t_1, t0, data_dir):
+    with open(data_dir / "era5/aurora-0.25-static.pickle", "rb") as f:
         static_vars = pickle.load(f)
 
     batch = Batch(

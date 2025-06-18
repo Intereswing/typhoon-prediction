@@ -1,9 +1,9 @@
 from pathlib import Path
-from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
 import torch
+from einops import rearrange
 from torch.utils.data import Dataset
 from aurora import Batch, Metadata
 import xarray as xr
@@ -47,19 +47,31 @@ def aurora_collate_fn(batch):
 
 
 class TyphoonTrajectoryDataset(Dataset):
-    def __init__(self, data_dir, year_start, year_end, lookback=8, horizon=12, with_era5=False, with_hres_t0=False, with_msl=False):
+    def __init__(
+            self,
+            data_dir,
+            year_start,
+            year_end,
+            lookback=8,
+            horizon=12,
+            with_era5_for_aurora=False,
+            with_hres_t0_for_aurora=False,
+            with_msl=False,
+            with_era5=False,
+        ):
         self.data_dir = Path(data_dir)
         self.lookback = lookback
         self.horizon = horizon
-        self.with_era5 = with_era5
-        self.with_hres_t0 = with_hres_t0
+        self.with_era5_for_aurora = with_era5_for_aurora
+        self.with_hres_t0_for_aurora = with_hres_t0_for_aurora
         self.with_msl = with_msl
+        self.with_era5 = with_era5 # Only use msl
 
-        self.data_typhoons = OrderedDict() # {typhoon Path: {time: (lat, lon)}}
+        self.data_typhoons = {} # {typhoon Path: {time: (lat, lon)}}
 
         for year in range(year_start, year_end + 1): # 遍历年份。
             for data_file in sorted((self.data_dir / f"bwp{year}").glob("bwp*")): # 遍历一年里的所有台风。
-                data_per_typhoon = OrderedDict() # 使用字典，避免一个时刻有多个位置记录。
+                data_per_typhoon = {} # 使用字典，避免一个时刻有多个位置记录。
                 data_per_typhoon_raw = data_file.read_text().splitlines()
                 for line in data_per_typhoon_raw:
                     #e.g. WP, 01, 1950050612,   , BEST,   0,  72N, 1508E,  30
@@ -82,6 +94,10 @@ class TyphoonTrajectoryDataset(Dataset):
             self.msl_mean = 1.009578e05
             self.msl_std = 1.332246e03
 
+        if self.with_era5:
+            # variable order: [msl]
+            self.era5_mean = torch.tensor([1.009578e05])
+            self.era5_std = torch.tensor([1.332246e03])
 
     def __len__(self):
         # 每一条台风对应 len - (lookback + horizon) + 1 条数据
@@ -106,20 +122,23 @@ class TyphoonTrajectoryDataset(Dataset):
                 # Normalization
                 trajectory = (trajectory - self.mean) / self.std
 
-                if not self.with_era5 and not self.with_hres_t0 and not self.with_msl:
+                if not self.with_era5_for_aurora and not self.with_hres_t0_for_aurora and not self.with_msl and not self.with_era5:
                     return trajectory[:self.lookback], trajectory[self.lookback:]
-                elif self.with_era5:
+
+                elif self.with_era5_for_aurora:
                     ts = list(data_per_typhoon.keys())[idx + self.lookback - 2: idx + self.lookback]
                     era5_t0 = xr.open_dataset(self.data_dir / "era5" / f"{ts[1]}.nc")
                     era5_t_1 = xr.open_dataset(self.data_dir / "era5" / f"{ts[0]}.nc") # t = -1
-                    batch = get_aurora_batch_era5(era5_t0, era5_t_1, ts[1])
+                    batch = get_aurora_batch_era5(era5_t0, era5_t_1, ts[1], self.data_dir)
                     return trajectory[:self.lookback], trajectory[self.lookback:], batch
-                elif self.with_hres_t0:
+
+                elif self.with_hres_t0_for_aurora:
                     ts = list(data_per_typhoon.keys())[idx + self.lookback - 2: idx + self.lookback]
                     hres_t0 = xr.open_dataset(self.data_dir / "hres_t0" / f"{ts[1]}.nc")
                     hres_t_1 = xr.open_dataset(self.data_dir / "hres_t0" / f"{ts[0]}.nc")
                     batch = get_aurora_batch_hres_t0(hres_t0, hres_t_1, ts[1])
                     return trajectory[:self.lookback], trajectory[self.lookback:], batch
+
                 elif self.with_msl:
                     ts = list(data_per_typhoon.keys())[idx: idx + self.lookback + self.horizon]
                     msl = [np.load(self.data_dir / "msl" / f"{t}.npy") for t in ts]
@@ -128,7 +147,22 @@ class TyphoonTrajectoryDataset(Dataset):
                     msl = (msl - self.msl_mean) / self.msl_std
                     return (trajectory[:self.lookback], trajectory[self.lookback:],
                             msl[:self.lookback], msl[self.lookback:])
+
+                elif self.with_era5:
+                    ts = list(data_per_typhoon.keys())[idx + self.lookback: idx + self.lookback + self.horizon]
+                    variable_names = ["mean_sea_level_pressure"]
+                    era5_data = [xr.open_dataset(self.data_dir / "era5" / f"{t}.nc")[variable_names].to_array().values for t in ts]
+                    era5_data = np.stack(era5_data, axis=0) # [T, C, H, W]
+                    era5_data = torch.from_numpy(era5_data)
+
+                    # normalize
+                    era5_data = (era5_data - self.era5_mean[..., None, None]) / self.era5_std[..., None, None]
+
+                    return trajectory[:self.lookback], trajectory[self.lookback:], era5_data
+
+
         return None
+
 
     def get_mean_std(self):
         all_data = []
@@ -168,12 +202,7 @@ class TyphoonTrajectoryDataset(Dataset):
 
 
     def download_era5(self):
-        """
-        Download the corresponding ERA5 data for the area between 0° and 59.75°N latitude, and between 100°E and
-        179.75°E longitude.
-
-        :return:
-        """
+        """Download ERA5 data as extra information for development of neural tracker."""
         url = "gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr"
         era5_ds = xr.open_zarr(url)
 
@@ -181,7 +210,7 @@ class TyphoonTrajectoryDataset(Dataset):
         (self.data_dir / "era5").mkdir(parents=True, exist_ok=True)
 
         for typhoon_file, data_per_typhoon in self.data_typhoons.items():
-            time_per_typhoon_need_era5 = list(data_per_typhoon.keys())[self.lookback - 2: -self.horizon]
+            time_per_typhoon_need_era5 = list(data_per_typhoon.keys())[self.lookback:]
 
             for date_time_str in time_per_typhoon_need_era5:
                 time2download.append(date_time_str)
@@ -279,8 +308,8 @@ class TyphoonTrajectoryDataset(Dataset):
 
 
 if __name__ == "__main__":
-    ds_dir = "/data/jiyilun/typhoon/download"
+    ds_dir = "/data1/jiyilun/typhoon"
     # calculate mean and std
-    ds = TyphoonTrajectoryDataset(ds_dir, 2011, 2020, lookback=8, horizon=12, with_era5=True)
-    print(len(ds))
+    ds = TyphoonTrajectoryDataset(ds_dir, 2011, 2022, lookback=8, horizon=12, with_era5=True)
+    ds.download_era5()
 
