@@ -9,8 +9,7 @@ from aurora import Batch, Metadata
 
 
 def setup_logger(log_dir, log_name):
-    """
-    Set up logger of file and console.
+    """Set up logger of file and console.
 
     :param log_dir: Directory containing log file.
     :param log_name: Name of log file.

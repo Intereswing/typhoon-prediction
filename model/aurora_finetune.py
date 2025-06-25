@@ -2,7 +2,12 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange, repeat, reduce
 from aurora import AuroraSmall, rollout, Batch, Metadata
+from sqlalchemy.engine import cursor
+
+from model.layers.FPN import FPN, Bottleneck
 
 
 class CNNEncoder(nn.Module):
@@ -14,9 +19,12 @@ class CNNEncoder(nn.Module):
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1), # [B, 64, 120, 160]
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)) # [B, 64, 1, 1]
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), # [B, 128, 60, 80]
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)) # [B, 128, 1, 1]
         )
-        self.fc = nn.Linear(64, hidden_dim)
+        self.fc = nn.Linear(128, hidden_dim)
 
     def forward(self, x):
         B, T, C, H, W = x.shape
@@ -65,11 +73,124 @@ class AuroraForTyphoon(nn.Module):
         return out
 
 
-class NeuralTracker(nn.Module):
-    def __init__(self, obs_len, pred_len):
-        traj_encoder = nn.Sequential(
-            nn.Linear(obs_len * 2, )
+class NeuralTrackerV1(nn.Module):
+    def __init__(self, obs_len, pred_len, hidden_size=64):
+        super().__init__()
+        self.embedding = nn.Linear(2, hidden_size)
+        self.traj_encoder = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            batch_first=True,
+            num_layers=3,
         )
+        self.atmos_encoder = CNNEncoder(in_channels=1, hidden_dim=hidden_size)
+        self.traj_decoder = nn.LSTM(
+            input_size=hidden_size + hidden_size,
+            hidden_size=hidden_size,
+            batch_first=True,
+            num_layers=3,
+        )
+        self.out_net = nn.Linear(hidden_size, 2)
+        self.obs_len = obs_len
+        self.pred_len = pred_len
+
+    def forward(self, obs_traj, pred_atmos):
+        # obs_traj: [4, 8, 2]
+        # pred_atmos: [4, 12, 1, 240, 320]
+        obs_traj_embed = self.embedding(obs_traj) # [B, T, 64]
+        _, (obs_traj_h, _) = self.traj_encoder(obs_traj_embed) # [3, B, 64]
+        obs_traj_h = obs_traj_h[-1] # [B, 64]
+        obs_traj_h = repeat(obs_traj_h, 'b h -> b t h', t=self.pred_len)  # [B, 12, 64]
+        pred_atmos_h = self.atmos_encoder(pred_atmos)  # [B, 12, 64]
+        fused_h = torch.cat([obs_traj_h, pred_atmos_h], dim=-1)  # [B, 12, 128]
+        pred_traj_h, (_, _) = self.traj_decoder(fused_h) # [B, 12, 64]
+        pred_traj = self.out_net(pred_traj_h) # [B, 12, 2]
+        return pred_traj
+
+
+class NeuralTrackerV2(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.traj_encoder = nn.Linear(2, 64)
+        self.atmos_encoder = FPN(block=Bottleneck, num_blocks=[2, 2, 2, 2])
+        self.traj_decoder = nn.Sequential(
+            nn.Linear(64 + 256*4, 256),
+            nn.ReLU(),
+            nn.Linear(256, 2)
+        )
+
+
+    def forward(self, traj, pred_atmos):
+        # traj: [B, 2]
+        # pred_atmos: [B, C, H, W]
+        traj_embed = self.traj_encoder(traj)
+        p2, p3, p4, p5 = self.atmos_encoder(pred_atmos)
+        weather_feat = []
+        for p in [p2, p3, p4, p5]:
+            pooled = F.adaptive_avg_pool2d(p, output_size=1)  # shape: [B, 256, 1, 1]
+            weather_feat.append(pooled.squeeze(-1).squeeze(-1))  # [B, 256]
+        weather_embed = torch.cat(weather_feat, dim=-1)  # shape: [B, 256*4] = [B, 1024]
+        out = self.traj_decoder(torch.cat([weather_embed, traj_embed], dim=-1))
+
+        return out
+
+
+class NeuralTrackerV3(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.traj_encoder = nn.Linear(2, 64)
+        self.atmos_encoder = FPN(block=Bottleneck, num_blocks=[2, 2, 2, 2])
+        self.traj_decoder = nn.Sequential(
+            nn.Linear(64 + 256 * 4, 256),
+            nn.ReLU(),
+            nn.Linear(256, 2)
+        )
+
+    def crop_atmos(self, coords, atmos, delta=5.0):
+        B, C, H, W = atmos.shape
+        device = atmos.device
+
+        lat_res = 0.25
+        lon_res = 0.25
+        crop_size = int(2 * delta / lat_res)
+
+        lat_vals = torch.linspace(90, -90, H, device=device)
+        lon_vals = torch.linspace(0, 360 - lon_res, W, device=device)
+
+        lat_centers = coords[:, 0]
+        lon_centers = coords[:, 1]
+
+        lat_idx = torch.argmin(torch.abs(lat_vals[None, :] - lat_centers[:, None]), dim=1) # [B]
+        lon_idx = torch.argmin(torch.abs(lon_vals[None, :] - lon_centers[:, None]), dim=1) # [B]
+
+        offset = crop_size // 2
+
+        lat_indices = lat_idx[:, None] + torch.arange(-offset, -offset + crop_size, device=device) # [B, 40]
+        lon_indices = lon_idx[:, None] + torch.arange(-offset, -offset + crop_size, device=device) # [B, 40]
+
+        lat_idx_grid = lat_indices[:, None, :, None].expand(-1, C, -1, W) # [B, C, H_c, W]
+        lon_idx_grid = lon_indices[:, None, None, :].expand(-1, C, crop_size, -1) # [B, C, H_c, W_c]
+
+        cropped_atmos = torch.gather(atmos, dim=2, index=lat_idx_grid)
+        cropped_atmos = torch.gather(cropped_atmos, dim=3, index=lon_idx_grid)
+        return cropped_atmos
+
+    def forward(self, traj, traj_real, pred_atmos):
+        # traj: [B, 2]
+        # pred_atmos: [B, C, H, W]
+        traj_embed = self.traj_encoder(traj)
+
+        pred_atmos_crop = self.crop_atmos(traj_real, pred_atmos, delta=5.0) # b c 40 40
+        p2, p3, p4, p5 = self.atmos_encoder(pred_atmos_crop)
+        weather_feat = []
+        for p in [p2, p3, p4, p5]:
+            pooled = F.adaptive_avg_pool2d(p, output_size=1)  # shape: [B, 256, 1, 1]
+            weather_feat.append(pooled.squeeze(-1).squeeze(-1))  # [B, 256]
+        weather_embed = torch.cat(weather_feat, dim=-1)  # shape: [B, 256*4] = [B, 1024]
+
+        out = self.traj_decoder(torch.cat([weather_embed, traj_embed], dim=-1))
+
+        return out
 
 
 
@@ -84,16 +205,15 @@ if __name__ == "__main__":
             time=(datetime(2020, 6, 1, 12, 0),),
             atmos_levels=(50, 100, 150,200,250,300,400,500,600,700,850,925,1000),
         ),
-    ).to("cuda:4")
-    hist_traj = torch.randn(1, 8, 2).to("cuda:4")
+    )
+    p_atmos = torch.randn(1, 1, 721, 1440)
+    hist_traj = torch.randn(1, 2)
+    hist_traj_real = torch.tensor([[30, 140]])
 
-    model = AuroraForTyphoon(8, 12).to("cuda:4")
-    model.train()
-    for param in model.aurora.parameters():
-        param.requires_grad = False
+    model = NeuralTrackerV3()
 
     t0 = datetime.now()
-    pred = model.forward(hist_traj, batch)
+    pred = model.forward(hist_traj, hist_traj_real, p_atmos)
     t1 = datetime.now()
     print(f"Calculate time: {(t1 - t0).total_seconds():.2f}s")
     print(pred.size())

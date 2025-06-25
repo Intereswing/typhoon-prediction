@@ -311,5 +311,8 @@ if __name__ == "__main__":
     ds_dir = "/data1/jiyilun/typhoon"
     # calculate mean and std
     ds = TyphoonTrajectoryDataset(ds_dir, 2011, 2022, lookback=8, horizon=12, with_era5=True)
-    ds.download_era5()
+    obs_traj, pred_traj, pred_era5 = ds[0]
+    print(obs_traj.shape)
+    print(pred_traj.shape)
+    print(pred_era5.shape)
 

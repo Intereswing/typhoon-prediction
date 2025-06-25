@@ -13,10 +13,11 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from aurora import AuroraSmall, Tracker, rollout
 from aurora.tracker import NoEyeException
+from einops import rearrange, repeat, reduce
 
 from data.dataset import TyphoonTrajectoryDataset, aurora_collate_fn
-from model.model import TrajectoryTransformer, TrajectoryPredictor
-from model.aurora_finetune import AuroraForTyphoon
+from model.typhoon_traj_model import TrajectoryTransformer, TrajectoryPredictor
+from model.aurora_finetune import AuroraForTyphoon, NeuralTrackerV1, NeuralTrackerV2, NeuralTrackerV3
 from utils.helper import setup_logger
 from utils.metrics import haversine_torch
 
@@ -38,19 +39,22 @@ def ddp_cleanup():
     dist.destroy_process_group()
 
 
-def train(local_rank):
-    if local_rank == 0:
-        print(f"Train start!")
+def train(local_rank, world_size):
     data_dir = "/data1/jiyilun/typhoon"
-    checkpoints_dir = Path("checkpoints") / "aurora_finetune"
-    if local_rank ==0:
-        checkpoints_dir.mkdir(exist_ok=True, parents=True)
+    model_name = "neural_tracker_v3"
+    checkpoints_dir = Path("checkpoints") / model_name
+    log_dir = Path("logs") / model_name
+
+    checkpoints_dir.mkdir(exist_ok=True, parents=True)
+    log_dir.mkdir(exist_ok=True, parents=True)
+    logger = setup_logger(log_dir, "train")
+    batch_size = 64
 
     # model and optimizer
-    model = AuroraForTyphoon(obs_len=8, pred_len=12).to(local_rank)
-    model.aurora.load_checkpoint_local("checkpoints/aurora/aurora-0.25-small-pretrained.ckpt")
-    for param in model.aurora.parameters():
-        param.requires_grad = False
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(NeuralTrackerV3()).to(local_rank)
+    # model.aurora.load_checkpoint_local("checkpoints/aurora/aurora-0.25-small-pretrained.ckpt")
+    # for param in model.aurora.parameters():
+    #     param.requires_grad = False
     ddp_model = DDP(model, device_ids=[local_rank])
 
     loss_fn = nn.MSELoss()
@@ -62,70 +66,99 @@ def train(local_rank):
 
     # dataset and sampler
     train_dataset = TyphoonTrajectoryDataset(
-        data_dir, 2011, 2020, 8, 12, with_era5_for_aurora=True
+        data_dir, 2011, 2020, 8, 12, with_era5=True
     )
     train_sampler = DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, batch_size=1, sampler=train_sampler, collate_fn=aurora_collate_fn)
+    train_dataloader = DataLoader(train_dataset, batch_size=int(batch_size / world_size), sampler=train_sampler)
 
     val_dataset = TyphoonTrajectoryDataset(
-        data_dir, 2021, 2021, 8, 12, with_era5_for_aurora=True
+        data_dir, 2021, 2021, 8, 12, with_era5=True
     )
     val_sampler = DistributedSampler(val_dataset)
-    val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, sampler=val_sampler, collate_fn=aurora_collate_fn)
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=int(batch_size / world_size),
+        shuffle=False,
+        sampler=val_sampler,
+    )
 
-    num_epoch = 10
+    num_epoch = 100
     step = 0
     print_per_step = 5
     num_step = num_epoch * len(train_dataloader)
 
     best_val_loss = float("inf")
-    num_patience = 3
+    num_patience = 5
     patience = num_patience
-    should_stop = torch.tensor(0).to(local_rank)
-    for epoch in range(num_epoch):
-        train_sampler.set_epoch(epoch)
+    should_stop = torch.tensor([0]).to(local_rank)
 
+    if local_rank == 0:
+        logger.info(f"Train start!")
+
+    for epoch in range(num_epoch):
+        # Train
+        train_sampler.set_epoch(epoch)
         ddp_model.train()
-        for obs_traj, gt_traj, obs_atmos in train_dataloader:
+        for obs_traj, gt_traj, pred_atmos in train_dataloader:
             step += 1
 
-            obs_traj, gt_traj, obs_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), obs_atmos.to(local_rank)
-            pred_traj = ddp_model(obs_traj, obs_atmos)
+            obs_traj, gt_traj, pred_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), pred_atmos.to(local_rank)
+            # obs_traj: [B, 8, 2]
+            # pred_atmos: [B, 12, 1, H, W]
+            obs_traj = torch.cat([obs_traj[:, -1][:, None], gt_traj[:, :-1]], dim=1) # [B, 12, 2]
+            obs_traj = rearrange(obs_traj, 'b t d -> (b t) d')
+            pred_atmos = rearrange(pred_atmos, 'b t c h w -> (b t) c h w')
+            obs_traj_real = train_dataset.denorm_traj([obs_traj.cpu()])[0].to(local_rank)
+
+            pred_traj = ddp_model(obs_traj, obs_traj_real, pred_atmos)
+            pred_traj = rearrange(pred_traj, '(b t) d -> b t d', t=gt_traj.size(1))
+
             loss = loss_fn(pred_traj, gt_traj)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             if local_rank == 0 and step % print_per_step == 0:
-                print(f"{datetime.datetime.now()} | [Epoch {epoch+1}/{num_epoch}] | step {step}/{num_step} | train loss: {loss.item()}")
+                logger.info(f"[Epoch {epoch+1}/{num_epoch}] | step {step}/{num_step} | train loss: {loss.item()}")
 
+        # Validate
         ddp_model.eval()
         total_loss = 0
         num_samples = 0
         with torch.no_grad(): # no_grad is a fn. Only after calling, it can return a context manager.
-            for obs_traj, gt_traj, obs_atmos in val_dataloader:
-                obs_traj, gt_traj, obs_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), obs_atmos.to(local_rank)
-                pred_traj = ddp_model(obs_traj, obs_atmos)
-                loss = loss_fn(pred_traj, gt_traj)
+            for obs_traj, gt_traj, pred_atmos in val_dataloader:
+                obs_traj, gt_traj, pred_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), pred_atmos.to(local_rank)
+                hist_traj = obs_traj[:, -1]
+                pred_traj_list = []
+                for t in range(pred_atmos.size(1)):
+                    hist_traj_real = train_dataset.denorm_traj([hist_traj.cpu()])[0].to(local_rank)
+                    pred_traj = ddp_model(hist_traj, hist_traj_real, pred_atmos[:, t])
+                    hist_traj = pred_traj
+                    pred_traj_list.append(pred_traj)
+                loss = loss_fn(rearrange(pred_traj_list, 't b d -> b t d'), gt_traj)
 
                 total_loss += loss.item() * obs_traj.size(0)
                 num_samples += obs_traj.size(0)
+
+        # Collect validation loss.
         val_loss = torch.tensor(total_loss).to(local_rank)
         val_samples = torch.tensor(num_samples).to(local_rank)
         if local_rank == 0:
-            print(f"Validation loss on rank {local_rank} before all_reduce: {val_loss.item()}")
-            print(f"Validation samples on rank {local_rank} before all_reduce: {val_samples.item()}")
+            logger.info(f"Validation loss on rank {local_rank} before all_reduce: {val_loss.item()}")
+            logger.info(f"Validation samples on rank {local_rank} before all_reduce: {val_samples.item()}")
 
         dist.all_reduce(val_loss)
         dist.all_reduce(val_samples)
 
         if local_rank == 0:
-            print(f"Validation loss on rank {local_rank} after all_reduce: {val_loss.item()}")
-            print(f"Validation samples on rank {local_rank} after all_reduce: {val_samples.item()}")
+            logger.info(f"Validation loss on rank {local_rank} after all_reduce: {val_loss.item()}")
+            logger.info(f"Validation samples on rank {local_rank} after all_reduce: {val_samples.item()}")
 
         avg_val_loss = val_loss.item() / val_samples.item()
+
+        # Save model
         if local_rank == 0:
-            print(f"[Epoch {epoch + 1}/{num_epoch}] | validate loss: {avg_val_loss}")
+            logger.info(f"[Epoch {epoch + 1}/{num_epoch}] | validate loss: {avg_val_loss}")
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 patience = num_patience
@@ -133,20 +166,21 @@ def train(local_rank):
                     {k: v for k, v in ddp_model.module.state_dict().items() if not k.startswith("aurora.")},
                     checkpoints_dir / f"model_epoch_{epoch+1}.pt"
                 )
-                print(f"Update model checkpoint in epoch {epoch+1}.")
+                logger.info(f"Update model checkpoint in epoch {epoch+1}.")
             else:
                 patience -= 1
-                print(f"Patience minus 1. Now {patience}.")
+                logger.info(f"Patience minus 1. Now {patience}.")
                 if patience <= 0:
                     should_stop[0] = 1
 
+        # Early stop.
         dist.broadcast(should_stop, src=0)
         if should_stop.item() == 1:
-            print(f"[rank {local_rank}] Early stopping triggered.")
+            logger.info(f"[rank {local_rank}] Early stopping triggered.")
             break
 
     if local_rank == 0:
-        print(f"Train over!")
+        logger.info(f"Train over!")
 
 
 def evaluate(local_rank):
@@ -215,8 +249,8 @@ def evaluate(local_rank):
 def main():
     rank, local_rank, world_size = get_dist_info()
     ddp_setup(local_rank)
-    # train(local_rank)
-    evaluate(local_rank)
+    train(local_rank, world_size)
+    # evaluate(local_rank)
     ddp_cleanup()
 
 

@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 import torch.optim as opt
 
 from data.dataset import TyphoonTrajectoryDataset, aurora_collate_fn
-from model.model import TrajectoryTransformer, TrajectoryPredictor
+from model.typhoon_traj_model import TrajectoryTransformer, TrajectoryPredictor
 from utils.helper import setup_logger
 from utils.metrics import haversine
 from utils.visualization import plot_and_save
