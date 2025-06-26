@@ -4,7 +4,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
 
-def plot_and_save(x, y, y_p, idx, savepath):
+def plot_and_save(obs_traj, gt_traj, pred_traj, i, dataset, fig_dir):
     lon_min, lon_max = 100, 180
     lat_min, lat_max = 0, 60
 
@@ -17,12 +17,13 @@ def plot_and_save(x, y, y_p, idx, savepath):
     ax.add_feature(cfeature.BORDERS, linestyle=':')
 
     # Trajectory
-    ax.scatter(x[:, 1], x[:, 0], color='green', s=3, label="Observed")
-    ax.scatter(y_p[:, 1], y_p[:, 0], color='red', s=3, label="Prediction")
-    ax.scatter(y[:, 1], y[:, 0], color='blue', s=3, label="Ground truth")
+    ax.scatter(obs_traj[:, 1], obs_traj[:, 0], color='green', s=3, label="Observed")
+    ax.scatter(pred_traj[:, 1], pred_traj[:, 0], color='red', s=3, label="Prediction")
+    ax.scatter(gt_traj[:, 1], gt_traj[:, 0], color='blue', s=3, label="Ground truth")
 
-    plt.title(f"Typhoon {idx}")
+    typhoon_name = dataset.get_typhoon_name(i)
+    plt.title(typhoon_name)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(savepath / f"typhoon {idx}.png", dpi=300)
+    plt.savefig(fig_dir / f"typhoon {i} {typhoon_name}.png", dpi=300)
     plt.clf()

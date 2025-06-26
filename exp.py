@@ -20,6 +20,7 @@ from model.typhoon_traj_model import TrajectoryTransformer, TrajectoryPredictor
 from model.aurora_finetune import AuroraForTyphoon, NeuralTrackerV1, NeuralTrackerV2, NeuralTrackerV3
 from utils.helper import setup_logger
 from utils.metrics import haversine_torch
+from utils.visualization import plot_and_save
 
 
 def get_dist_info():
@@ -41,7 +42,7 @@ def ddp_cleanup():
 
 def train(local_rank, world_size):
     data_dir = "/data1/jiyilun/typhoon"
-    model_name = "neural_tracker_v3"
+    model_name = "neural_tracker_v1"
     checkpoints_dir = Path("checkpoints") / model_name
     log_dir = Path("logs") / model_name
 
@@ -51,7 +52,8 @@ def train(local_rank, world_size):
     batch_size = 64
 
     # model and optimizer
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(NeuralTrackerV3()).to(local_rank)
+    model = NeuralTrackerV1(obs_len=8, pred_len=12).to(local_rank)
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     # model.aurora.load_checkpoint_local("checkpoints/aurora/aurora-0.25-small-pretrained.ckpt")
     # for param in model.aurora.parameters():
     #     param.requires_grad = False
@@ -102,16 +104,21 @@ def train(local_rank, world_size):
         for obs_traj, gt_traj, pred_atmos in train_dataloader:
             step += 1
 
-            obs_traj, gt_traj, pred_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), pred_atmos.to(local_rank)
             # obs_traj: [B, 8, 2]
             # pred_atmos: [B, 12, 1, H, W]
-            obs_traj = torch.cat([obs_traj[:, -1][:, None], gt_traj[:, :-1]], dim=1) # [B, 12, 2]
-            obs_traj = rearrange(obs_traj, 'b t d -> (b t) d')
-            pred_atmos = rearrange(pred_atmos, 'b t c h w -> (b t) c h w')
-            obs_traj_real = train_dataset.denorm_traj([obs_traj.cpu()])[0].to(local_rank)
+            obs_traj, gt_traj, pred_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), pred_atmos.to(local_rank)
 
-            pred_traj = ddp_model(obs_traj, obs_traj_real, pred_atmos)
-            pred_traj = rearrange(pred_traj, '(b t) d -> b t d', t=gt_traj.size(1))
+            '''auto-regressive teacher force training.'''
+            # obs_traj = torch.cat([obs_traj[:, -1][:, None], gt_traj[:, :-1]], dim=1) # [B, 12, 2]
+            # obs_traj = rearrange(obs_traj, 'b t d -> (b t) d')
+            # pred_atmos = rearrange(pred_atmos, 'b t c h w -> (b t) c h w')
+            # obs_traj_real = train_dataset.denorm_traj([obs_traj.cpu()])[0].to(local_rank)
+            #
+            # pred_traj = ddp_model(obs_traj, obs_traj_real, pred_atmos)
+            # pred_traj = rearrange(pred_traj, '(b t) d -> b t d', t=gt_traj.size(1))
+
+            '''end to end training'''
+            pred_traj = ddp_model(obs_traj, pred_atmos)
 
             loss = loss_fn(pred_traj, gt_traj)
 
@@ -125,17 +132,24 @@ def train(local_rank, world_size):
         ddp_model.eval()
         total_loss = 0
         num_samples = 0
-        with torch.no_grad(): # no_grad is a fn. Only after calling, it can return a context manager.
+        with torch.no_grad(): # No_grad is a fn. Only after calling, it can return a context manager.
             for obs_traj, gt_traj, pred_atmos in val_dataloader:
                 obs_traj, gt_traj, pred_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), pred_atmos.to(local_rank)
-                hist_traj = obs_traj[:, -1]
-                pred_traj_list = []
-                for t in range(pred_atmos.size(1)):
-                    hist_traj_real = train_dataset.denorm_traj([hist_traj.cpu()])[0].to(local_rank)
-                    pred_traj = ddp_model(hist_traj, hist_traj_real, pred_atmos[:, t])
-                    hist_traj = pred_traj
-                    pred_traj_list.append(pred_traj)
-                loss = loss_fn(rearrange(pred_traj_list, 't b d -> b t d'), gt_traj)
+
+                '''auto-regressive inference'''
+                # hist_coord = obs_traj[:, -1]
+                # pred_traj = []
+                # for t in range(pred_atmos.size(1)):
+                #     hist_coord_real = train_dataset.denorm_traj([hist_coord.cpu()])[0].to(local_rank)
+                #     pred_coord = ddp_model(hist_coord, hist_coord_real, pred_atmos[:, t])
+                #     hist_coord = pred_coord
+                #     pred_traj.append(pred_coord)
+                # pred_traj = rearrange(pred_traj, 't b d -> b t d')
+
+                '''end to end inference'''
+                pred_traj = ddp_model(obs_traj, pred_atmos)
+
+                loss = loss_fn(pred_traj, gt_traj)
 
                 total_loss += loss.item() * obs_traj.size(0)
                 num_samples += obs_traj.size(0)
@@ -187,22 +201,28 @@ def evaluate(local_rank):
     if local_rank == 0:
         print(f"Evaluate start!")
     data_dir = "/data1/jiyilun/typhoon"
-    checkpoints_dir = Path("checkpoints") / "aurora_finetune"
-    checkpoint = torch.load(checkpoints_dir / "model_epoch_9.pt")
+    model_name = "neural_tracker_v3"
+    checkpoints_dir = Path("checkpoints") / model_name
+    checkpoint = torch.load(checkpoints_dir / "model_epoch_39.pt")
+
+    log_dir = Path("logs") / model_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(log_dir, 'evaluate')
+
+    fig_dir = Path("figures") / model_name
+    fig_dir.mkdir(parents=True, exist_ok=True)
 
     # model
-    model = AuroraSmall().to(local_rank)
-    model.load_checkpoint_local("checkpoints/aurora/aurora-0.25-small-pretrained.ckpt")
-    # model.load_state_dict(checkpoint, strict=False)
-
+    model = NeuralTrackerV3().to(local_rank)
+    model.load_state_dict(checkpoint, strict=True)
     ddp_model = DDP(model, device_ids=[local_rank])
 
     # dataset
     test_dataset = TyphoonTrajectoryDataset(
-        data_dir, 2022, 2022, 8, 12, with_era5_for_aurora=True
+        data_dir, 2022, 2022, 8, 12, with_era5=True
     )
     test_sampler = DistributedSampler(test_dataset)
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, sampler=test_sampler, collate_fn=aurora_collate_fn)
+    test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False, sampler=test_sampler)
 
     # evaluate
     ddp_model.eval()
@@ -210,28 +230,40 @@ def evaluate(local_rank):
     num_samples = torch.tensor(0).to(local_rank)
     step = 0
     with torch.inference_mode():
-        for obs_traj, gt_traj, obs_atmos in test_dataloader:
+        for obs_traj, gt_traj, pred_atmos in test_dataloader:
             step += 1
-            obs_traj, gt_traj, obs_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), obs_atmos.to(local_rank)
+            obs_traj, gt_traj, pred_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), pred_atmos.to(local_rank)
 
-            # Initialize tracker
-            init = test_dataset.denorm_traj([obs_traj.cpu()])[0][0, -1]
-            init = init.numpy()
-            tracker = Tracker(init_lat=init[0], init_lon=init[1], init_time=obs_atmos.metadata.time[0])
+            '''aurora tracker inference'''
+            # init = test_dataset.denorm_traj([obs_traj.cpu()])[0][0, -1]
+            # init = init.numpy()
+            # tracker = Tracker(init_lat=init[0], init_lon=init[1], init_time=obs_atmos.metadata.time[0])
+            # try:
+            #     for pred_atmos in rollout(ddp_model.module, obs_atmos, gt_traj.size(1)):
+            #         tracker.step(pred_atmos)
+            # except NoEyeException:
+            #     print(f"Rank {local_rank} | {step}/{len(test_dataloader)} | NoEyeException detected.")
+            #     continue
+            # track = tracker.results()
+            # pred_traj = np.stack([track.lat[1:], track.lon[1:]], axis=1)[None] # [1, 12, 2]
+            # pred_traj = torch.from_numpy(pred_traj)
 
-            # Tracker work.
-            try:
-                for pred_atmos in rollout(ddp_model.module, obs_atmos, gt_traj.size(1)):
-                    tracker.step(pred_atmos)
-            except NoEyeException:
-                print(f"Rank {local_rank} | {step}/{len(test_dataloader)} | NoEyeException detected.")
-                continue
+            '''end to end inference'''
+            # pred_traj = ddp_model(obs_traj, pred_atmos)
+            # pred_traj = test_dataset.denorm_traj(pred_traj.cpu())
 
-            # Retrieve results
-            track = tracker.results()
-            pred_traj = np.stack([track.lat[1:], track.lon[1:]], axis=1)[None] # [1, 12, 2]
-            pred_traj = torch.from_numpy(pred_traj)
-            gt_traj = test_dataset.denorm_traj([gt_traj.cpu()])[0] # [B, T, 2]
+            '''auto-regressive inference'''
+            hist_coord = obs_traj[:, -1]
+            pred_traj = []
+            for t in range(pred_atmos.size(1)):
+                hist_coord_real = test_dataset.denorm_traj(hist_coord.cpu()).to(local_rank)
+                pred_coord = ddp_model(hist_coord, hist_coord_real, pred_atmos[:, t])
+                hist_coord = pred_coord
+                pred_traj.append(pred_coord)
+            pred_traj = rearrange(pred_traj, 't b d -> b t d')
+            pred_traj = test_dataset.denorm_traj(pred_traj.cpu())
+
+            gt_traj = test_dataset.denorm_traj(gt_traj.cpu()) # [B, T, 2]
 
             FDE += torch.sum(haversine_torch(gt_traj, pred_traj), dim=0).to(local_rank) # 在batch维度上计算和。
             num_samples += gt_traj.size(0)
@@ -241,100 +273,46 @@ def evaluate(local_rank):
 
     if local_rank == 0:
         FDE = FDE / num_samples
-        print(f"Final displacement error:")
+        logger.info(f"Final displacement error:")
         for i in range(FDE.size(0)):
-            print(f"{(i+1)*6}h: {FDE[i].item():.2f} km.")
+            logger.info(f"{(i+1)*6}h: {FDE[i].item():.2f} km.")
+
+        with torch.inference_mode():
+            visualize_prediction(ddp_model, test_dataset, fig_dir, local_rank)
+
+
+def visualize_prediction(model, dataset, fig_dir, device):
+    for i in [0, 20, 43, 60, 80, 100]:
+        obs_traj, gt_traj, pred_atmos = dataset[i]
+        obs_traj, gt_traj, pred_atmos = obs_traj[None].to(device), gt_traj[None].to(device), pred_atmos[None].to(device)
+
+        '''end to end inference'''
+        # pred_traj = model(obs_traj, pred_atmos)
+        # pred_traj = pred_traj.squeeze(0)
+
+        '''auto-regressive inference'''
+        hist_coord = obs_traj[:, -1]
+        pred_traj = []
+        for t in range(pred_atmos.size(1)):
+            hist_coord_real = dataset.denorm_traj(hist_coord.cpu()).to(device)
+            pred_coord = model(hist_coord, hist_coord_real, pred_atmos[:, t])
+            hist_coord = pred_coord
+            pred_traj.append(pred_coord)
+        pred_traj = rearrange(pred_traj, 't b d -> b t d')
+
+        obs_traj, gt_traj, pred_traj = obs_traj.squeeze(0), gt_traj.squeeze(0), pred_traj.squeeze(0)
+        obs_traj, gt_traj, pred_traj = dataset.denorm_traj([obs_traj.cpu(), gt_traj.cpu(), pred_traj.cpu()])
+        plot_and_save(obs_traj, gt_traj, pred_traj, i, dataset, fig_dir)
 
 
 def main():
     rank, local_rank, world_size = get_dist_info()
     ddp_setup(local_rank)
-    train(local_rank, world_size)
-    # evaluate(local_rank)
+    # train(local_rank, world_size)
+    evaluate(local_rank)
     ddp_cleanup()
 
 
 if __name__ == "__main__":
     main()
-
-# # Path and log
-# model_name = "Trajectory Transformer Fusing MSL with U-Net"
-# device = "cuda" if torch.cuda.is_available() else "cpu"
-# data_dir = "/data/jiyilun/typhoon/download"
-# version = "1"
-#
-# checkpoint_dir = Path("checkpoints") / model_name / version
-# checkpoint_dir.mkdir(parents=True, exist_ok=True)
-# log_dir = Path("logs") / model_name / version
-# log_dir.mkdir(parents=True, exist_ok=True)
-# logger = setup_logger(log_dir, "train")
-#
-# # Training loop
-# logger.info("Training start!")
-# best_val_loss = float("inf")
-# for i in range(epochs):
-#     # Train
-#     model.train()
-#     train_traj_loss = 0
-#     train_msl_loss = 0
-#     train_loss = 0
-#     for j, (x, y, msl_obs, msl_gt) in enumerate(train_dataloader):
-#         x, y, msl_obs, msl_gt = x.to(device), y.to(device), msl_obs.to(device), msl_gt.to(device)
-#         optimizer.zero_grad()
-#
-#         y_p, msl_pred = model(x, msl_obs)
-#         # print(f"msl pred max: {torch.max(msl_pred)}")
-#         # print(f"msl pred min: {torch.min(msl_pred)}")
-#         # print("NaN in msl_gt:", torch.isnan(msl_gt).any().item())
-#         # print("Inf in msl_gt:", torch.isinf(msl_gt).any().item())
-#         # print("msl_gt max:", msl_gt.max().item())
-#         # print("msl_gt min:", msl_gt.min().item())
-#         loss_traj = criterion(y_p, y)
-#         loss_msl = criterion(msl_pred, msl_gt)
-#         loss = loss_msl * loss_alpha + loss_traj * (1 - loss_alpha)
-#         logger.info(f"Epoch {i+1}/{epochs} | Batch {j + 1}/{len(train_dataloader)} | "
-#                     f"Traj loss: {loss_traj.item()} | MSL loss: {loss_msl.item()} | Loss: {loss.item()}")
-#
-#         loss.backward()
-#         optimizer.step()
-#         train_traj_loss += loss_traj.item()
-#         train_msl_loss += loss_msl.item()
-#         train_loss += loss.item()
-#
-#     # Validate
-#     model.eval()
-#     val_loss = 0
-#     with torch.no_grad():
-#         for x, y, msl_obs, msl_gt in val_dataloader:
-#             x, y, msl_obs, msl_gt = x.to(device), y.to(device), msl_obs.to(device), msl_gt.to(device)
-#
-#             y_p, _ = model(x, msl_obs)
-#             loss = criterion(y_p, y)
-#
-#             # 验证集损失只关心轨迹损失
-#             val_loss += loss.item()
-#
-#     # Message
-#     avg_train_traj_loss = train_traj_loss / len(train_dataloader)
-#     avg_train_msl_loss = train_msl_loss / len(train_dataloader)
-#     avg_train_loss = train_loss / len(train_dataloader)
-#     avg_val_loss = val_loss / len(val_dataloader)
-#
-#     logger.info(f"Epoch {i+1} / {epochs} | "
-#                 f"Train traj loss: {avg_train_traj_loss:.4f} | Train MSL loss: {avg_train_msl_loss:.4f} | "
-#                 f"Train loss: {avg_train_loss:.4f} | "
-#                 f"Validate loss: {avg_val_loss:.4f}")
-#
-#     # Save best model
-#     if avg_val_loss < best_val_loss:
-#         best_val_loss = avg_val_loss
-#         torch.save(
-#             model.state_dict(),
-#             checkpoint_dir / f"best_model_epoch_{i+1}.pth"
-#         )
-#         torch.save(
-#             model.state_dict(),
-#             checkpoint_dir / f"best_model.pth"
-#         )
-#         logger.info(f"Update best_model_epoch_{i+1}.pth!")
 

@@ -73,6 +73,7 @@ class AuroraForTyphoon(nn.Module):
         return out
 
 
+# Past trajectory and future local graph -> future trajectory
 class NeuralTrackerV1(nn.Module):
     def __init__(self, obs_len, pred_len, hidden_size=64):
         super().__init__()
@@ -94,20 +95,32 @@ class NeuralTrackerV1(nn.Module):
         self.obs_len = obs_len
         self.pred_len = pred_len
 
+    def crop(self, atmos):
+        # atmos: b t c h w
+        device = atmos.device
+        lats = torch.linspace(90, -90, 721).to(device)
+        lons = torch.linspace(0, 360, 1440 + 1)[:-1].to(device)
+        lat_indices = (lats < 60) & (lats >= 0)
+        lon_indices = (lons < 180) & (lons >= 100)
+        crop_atmos = atmos[..., lat_indices, :][..., lon_indices]
+
+        return crop_atmos
+
     def forward(self, obs_traj, pred_atmos):
-        # obs_traj: [4, 8, 2]
-        # pred_atmos: [4, 12, 1, 240, 320]
+        # obs_traj: [b, 8, 2]
+        # pred_atmos: [b, 12, c, 721, 1440]
         obs_traj_embed = self.embedding(obs_traj) # [B, T, 64]
         _, (obs_traj_h, _) = self.traj_encoder(obs_traj_embed) # [3, B, 64]
         obs_traj_h = obs_traj_h[-1] # [B, 64]
         obs_traj_h = repeat(obs_traj_h, 'b h -> b t h', t=self.pred_len)  # [B, 12, 64]
-        pred_atmos_h = self.atmos_encoder(pred_atmos)  # [B, 12, 64]
+        pred_atmos_h = self.atmos_encoder(self.crop(pred_atmos))  # [B, 12, 64]
         fused_h = torch.cat([obs_traj_h, pred_atmos_h], dim=-1)  # [B, 12, 128]
         pred_traj_h, (_, _) = self.traj_decoder(fused_h) # [B, 12, 64]
         pred_traj = self.out_net(pred_traj_h) # [B, 12, 2]
         return pred_traj
 
 
+# One coordinate and one global graph -> next coordinate
 class NeuralTrackerV2(nn.Module):
     def __init__(self):
         super().__init__()
@@ -135,6 +148,7 @@ class NeuralTrackerV2(nn.Module):
         return out
 
 
+# One coordinate and one surrounding graph -> next coordinate
 class NeuralTrackerV3(nn.Module):
     def __init__(self):
         super().__init__()

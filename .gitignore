@@ -1,6 +1,6 @@
 .idea
 checkpoints
-figs
+figures
 logs
 debug/downloads
 **/__pycache__

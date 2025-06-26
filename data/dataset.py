@@ -160,7 +160,6 @@ class TyphoonTrajectoryDataset(Dataset):
 
                     return trajectory[:self.lookback], trajectory[self.lookback:], era5_data
 
-
         return None
 
 
@@ -192,9 +191,25 @@ class TyphoonTrajectoryDataset(Dataset):
         return idx
 
 
-    def denorm_traj(self, x_list):
-        x_denorm_list = [x * self.std + self.mean for x in x_list]
-        return x_denorm_list
+    def get_typhoon_name(self, idx: int):
+        typhoon_name = None
+        for typhoon_file, data_per_typhoon in self.data_typhoons.items():
+            if idx >= len(data_per_typhoon) - (self.lookback + self.horizon) + 1:
+                idx = idx - (len(data_per_typhoon) - (self.lookback + self.horizon) + 1)
+            else:
+                typhoon_name = typhoon_file.stem
+                break
+
+        return typhoon_name
+
+
+    def denorm_traj(self, x):
+        if isinstance(x, list):
+            return [x * self.std + self.mean for x in x]
+        elif isinstance(x, torch.Tensor):
+            return x * self.std + self.mean
+        else:
+            raise RuntimeError('denorm_traj only accepts list or torch.Tensor.')
 
 
     def denorm_msl(self, msl):
@@ -310,9 +325,5 @@ class TyphoonTrajectoryDataset(Dataset):
 if __name__ == "__main__":
     ds_dir = "/data1/jiyilun/typhoon"
     # calculate mean and std
-    ds = TyphoonTrajectoryDataset(ds_dir, 2011, 2022, lookback=8, horizon=12, with_era5=True)
-    obs_traj, pred_traj, pred_era5 = ds[0]
-    print(obs_traj.shape)
-    print(pred_traj.shape)
-    print(pred_era5.shape)
-
+    ds = TyphoonTrajectoryDataset(ds_dir, 2022, 2022, lookback=8, horizon=12, with_era5=True)
+    print(ds.get_typhoon_name(0))
