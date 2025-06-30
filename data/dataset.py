@@ -203,6 +203,11 @@ class TyphoonTrajectoryDataset(Dataset):
         return typhoon_name
 
 
+    def norm_traj(self, x):
+        # x: b t 2
+        return (x - self.mean) / self.std
+
+
     def denorm_traj(self, x):
         if isinstance(x, list):
             return [x * self.std + self.mean for x in x]

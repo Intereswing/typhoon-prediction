@@ -17,7 +17,8 @@ from einops import rearrange, repeat, reduce
 
 from data.dataset import TyphoonTrajectoryDataset, aurora_collate_fn
 from model.typhoon_traj_model import TrajectoryTransformer, TrajectoryPredictor
-from model.aurora_finetune import AuroraForTyphoon, NeuralTrackerV1, NeuralTrackerV2, NeuralTrackerV3
+from model.aurora_finetune import AuroraForTyphoon, NeuralTrackerV1, NeuralTrackerV2, NeuralTrackerV3, NeuralTrackerV4, \
+    NeuralTrackerV5
 from utils.helper import setup_logger
 from utils.metrics import haversine_torch
 from utils.visualization import plot_and_save
@@ -42,7 +43,7 @@ def ddp_cleanup():
 
 def train(local_rank, world_size):
     data_dir = "/data1/jiyilun/typhoon"
-    model_name = "neural_tracker_v1"
+    model_name = "neural_tracker_v5"
     checkpoints_dir = Path("checkpoints") / model_name
     log_dir = Path("logs") / model_name
 
@@ -50,21 +51,6 @@ def train(local_rank, world_size):
     log_dir.mkdir(exist_ok=True, parents=True)
     logger = setup_logger(log_dir, "train")
     batch_size = 64
-
-    # model and optimizer
-    model = NeuralTrackerV1(obs_len=8, pred_len=12).to(local_rank)
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    # model.aurora.load_checkpoint_local("checkpoints/aurora/aurora-0.25-small-pretrained.ckpt")
-    # for param in model.aurora.parameters():
-    #     param.requires_grad = False
-    ddp_model = DDP(model, device_ids=[local_rank])
-
-    loss_fn = nn.MSELoss()
-    optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, ddp_model.parameters()),
-        lr=1e-4,
-        weight_decay=1e-3
-    )
 
     # dataset and sampler
     train_dataset = TyphoonTrajectoryDataset(
@@ -84,13 +70,32 @@ def train(local_rank, world_size):
         sampler=val_sampler,
     )
 
+    # model and optimizer
+    model = NeuralTrackerV5(
+        traj_mean=train_dataset.mean,
+        traj_std=train_dataset.std,
+    ).to(local_rank)
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    # model.aurora.load_checkpoint_local("checkpoints/aurora/aurora-0.25-small-pretrained.ckpt")
+    # for param in model.aurora.parameters():
+    #     param.requires_grad = False
+    ddp_model = DDP(model, device_ids=[local_rank])
+
+    loss_fn = nn.MSELoss()
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, ddp_model.parameters()),
+        lr=1e-4,
+        weight_decay=1e-3
+    )
+
+
     num_epoch = 100
     step = 0
     print_per_step = 5
     num_step = num_epoch * len(train_dataloader)
 
     best_val_loss = float("inf")
-    num_patience = 5
+    num_patience = 10
     patience = num_patience
     should_stop = torch.tensor([0]).to(local_rank)
 
@@ -109,16 +114,16 @@ def train(local_rank, world_size):
             obs_traj, gt_traj, pred_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), pred_atmos.to(local_rank)
 
             '''auto-regressive teacher force training.'''
-            # obs_traj = torch.cat([obs_traj[:, -1][:, None], gt_traj[:, :-1]], dim=1) # [B, 12, 2]
-            # obs_traj = rearrange(obs_traj, 'b t d -> (b t) d')
-            # pred_atmos = rearrange(pred_atmos, 'b t c h w -> (b t) c h w')
-            # obs_traj_real = train_dataset.denorm_traj([obs_traj.cpu()])[0].to(local_rank)
-            #
-            # pred_traj = ddp_model(obs_traj, obs_traj_real, pred_atmos)
-            # pred_traj = rearrange(pred_traj, '(b t) d -> b t d', t=gt_traj.size(1))
+            full_traj = torch.cat([obs_traj, gt_traj], dim=1)
+            obs_traj_train = [full_traj[:, i: (i+8), :] for i in range(gt_traj.shape[1])]
+            obs_traj_train = rearrange(obs_traj_train, 't2 b t1 d -> (b t2) t1 d')
+            pred_atmos = rearrange(pred_atmos, 'b t2 c h w -> (b t2) c h w')
+
+            pred_traj = ddp_model(obs_traj_train, pred_atmos)
+            pred_traj = rearrange(pred_traj, '(b t2) d -> b t2 d', t2=gt_traj.size(1))
 
             '''end to end training'''
-            pred_traj = ddp_model(obs_traj, pred_atmos)
+            # pred_traj = ddp_model(obs_traj, pred_atmos)
 
             loss = loss_fn(pred_traj, gt_traj)
 
@@ -137,18 +142,18 @@ def train(local_rank, world_size):
                 obs_traj, gt_traj, pred_atmos = obs_traj.to(local_rank), gt_traj.to(local_rank), pred_atmos.to(local_rank)
 
                 '''auto-regressive inference'''
-                # hist_coord = obs_traj[:, -1]
-                # pred_traj = []
-                # for t in range(pred_atmos.size(1)):
-                #     hist_coord_real = train_dataset.denorm_traj([hist_coord.cpu()])[0].to(local_rank)
-                #     pred_coord = ddp_model(hist_coord, hist_coord_real, pred_atmos[:, t])
-                #     hist_coord = pred_coord
-                #     pred_traj.append(pred_coord)
-                # pred_traj = rearrange(pred_traj, 't b d -> b t d')
+                hist_traj = obs_traj
+                pred_traj = []
+                for t in range(gt_traj.shape[1]):
+                    pred_coord = ddp_model(hist_traj, pred_atmos[:, t])
+                    hist_traj = torch.cat([hist_traj[:, 1:], pred_coord[:, None]], dim=1)
+                    pred_traj.append(pred_coord)
+                pred_traj = rearrange(pred_traj, 't2 b d -> b t2 d')
 
                 '''end to end inference'''
-                pred_traj = ddp_model(obs_traj, pred_atmos)
+                # pred_traj = ddp_model(obs_traj, pred_atmos)
 
+                '''calculate loss'''
                 loss = loss_fn(pred_traj, gt_traj)
 
                 total_loss += loss.item() * obs_traj.size(0)
@@ -201,9 +206,9 @@ def evaluate(local_rank):
     if local_rank == 0:
         print(f"Evaluate start!")
     data_dir = "/data1/jiyilun/typhoon"
-    model_name = "neural_tracker_v3"
+    model_name = "neural_tracker_v5"
     checkpoints_dir = Path("checkpoints") / model_name
-    checkpoint = torch.load(checkpoints_dir / "model_epoch_39.pt")
+    checkpoint = torch.load(checkpoints_dir / "model_epoch_62.pt")
 
     log_dir = Path("logs") / model_name
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -212,17 +217,21 @@ def evaluate(local_rank):
     fig_dir = Path("figures") / model_name
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    # model
-    model = NeuralTrackerV3().to(local_rank)
-    model.load_state_dict(checkpoint, strict=True)
-    ddp_model = DDP(model, device_ids=[local_rank])
-
     # dataset
     test_dataset = TyphoonTrajectoryDataset(
         data_dir, 2022, 2022, 8, 12, with_era5=True
     )
     test_sampler = DistributedSampler(test_dataset)
-    test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False, sampler=test_sampler)
+    test_dataloader = DataLoader(test_dataset, batch_size=64, shuffle=False, sampler=test_sampler)
+
+    # model
+    model = NeuralTrackerV5(
+        traj_mean=test_dataset.mean,
+        traj_std=test_dataset.std,
+    ).to(local_rank)
+    model.load_state_dict(checkpoint, strict=True)
+    ddp_model = DDP(model, device_ids=[local_rank])
+
 
     # evaluate
     ddp_model.eval()
@@ -253,14 +262,14 @@ def evaluate(local_rank):
             # pred_traj = test_dataset.denorm_traj(pred_traj.cpu())
 
             '''auto-regressive inference'''
-            hist_coord = obs_traj[:, -1]
+            hist_traj = obs_traj
             pred_traj = []
-            for t in range(pred_atmos.size(1)):
-                hist_coord_real = test_dataset.denorm_traj(hist_coord.cpu()).to(local_rank)
-                pred_coord = ddp_model(hist_coord, hist_coord_real, pred_atmos[:, t])
-                hist_coord = pred_coord
+            for t in range(gt_traj.shape[1]):
+                pred_coord = ddp_model(hist_traj, pred_atmos[:, t])
+                hist_traj = torch.cat([hist_traj[:, 1:], pred_coord[:, None]], dim=1)
                 pred_traj.append(pred_coord)
-            pred_traj = rearrange(pred_traj, 't b d -> b t d')
+            pred_traj = rearrange(pred_traj, 't2 b d -> b t2 d')
+
             pred_traj = test_dataset.denorm_traj(pred_traj.cpu())
 
             gt_traj = test_dataset.denorm_traj(gt_traj.cpu()) # [B, T, 2]
@@ -277,8 +286,8 @@ def evaluate(local_rank):
         for i in range(FDE.size(0)):
             logger.info(f"{(i+1)*6}h: {FDE[i].item():.2f} km.")
 
-        with torch.inference_mode():
-            visualize_prediction(ddp_model, test_dataset, fig_dir, local_rank)
+        # with torch.inference_mode():
+        #     visualize_prediction(ddp_model, test_dataset, fig_dir, local_rank)
 
 
 def visualize_prediction(model, dataset, fig_dir, device):
@@ -291,14 +300,13 @@ def visualize_prediction(model, dataset, fig_dir, device):
         # pred_traj = pred_traj.squeeze(0)
 
         '''auto-regressive inference'''
-        hist_coord = obs_traj[:, -1]
+        hist_traj = obs_traj
         pred_traj = []
-        for t in range(pred_atmos.size(1)):
-            hist_coord_real = dataset.denorm_traj(hist_coord.cpu()).to(device)
-            pred_coord = model(hist_coord, hist_coord_real, pred_atmos[:, t])
-            hist_coord = pred_coord
+        for t in range(gt_traj.shape[1]):
+            pred_coord = model(hist_traj, pred_atmos[:, t])
+            hist_traj = torch.cat([hist_traj[:, 1:], pred_coord[:, None]], dim=1)
             pred_traj.append(pred_coord)
-        pred_traj = rearrange(pred_traj, 't b d -> b t d')
+        pred_traj = rearrange(pred_traj, 't2 b d -> b t2 d')
 
         obs_traj, gt_traj, pred_traj = obs_traj.squeeze(0), gt_traj.squeeze(0), pred_traj.squeeze(0)
         obs_traj, gt_traj, pred_traj = dataset.denorm_traj([obs_traj.cpu(), gt_traj.cpu(), pred_traj.cpu()])
