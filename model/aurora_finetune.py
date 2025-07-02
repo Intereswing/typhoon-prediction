@@ -9,6 +9,58 @@ from sqlalchemy.engine import cursor
 
 from model.layers.FPN import FPN, Bottleneck
 
+def crop_atmos(coords, atmos, delta=5.0):
+    B, C, H, W = atmos.shape
+    device = atmos.device
+
+    lat_res = 0.25
+    lon_res = 0.25
+    crop_size = int(2 * delta / lat_res)
+
+    lat_vals = torch.linspace(90, -90, H, device=device)
+    lon_vals = torch.linspace(0, 360 - lon_res, W, device=device)
+
+    lat_centers = coords[:, 0]
+    lon_centers = coords[:, 1]
+
+    lat_idx = torch.argmin(torch.abs(lat_vals[None, :] - lat_centers[:, None]), dim=1) # [B]
+    lon_idx = torch.argmin(torch.abs(lon_vals[None, :] - lon_centers[:, None]), dim=1) # [B]
+
+    offset = crop_size // 2
+
+    lat_indices = lat_idx[:, None] + torch.arange(-offset, -offset + crop_size, device=device) # [B, 40]
+    lon_indices = lon_idx[:, None] + torch.arange(-offset, -offset + crop_size, device=device) # [B, 40]
+
+    lat_idx_grid = lat_indices[:, None, :, None].expand(-1, C, -1, W) # [B, C, H_c, W]
+    lon_idx_grid = lon_indices[:, None, None, :].expand(-1, C, crop_size, -1) # [B, C, H_c, W_c]
+
+    cropped_atmos = torch.gather(atmos, dim=2, index=lat_idx_grid)
+    cropped_atmos = torch.gather(cropped_atmos, dim=3, index=lon_idx_grid)
+    return cropped_atmos
+
+
+def linear_regression(traj):
+    b, t, d = traj.shape
+    device = traj.device
+
+    time_steps = torch.arange(t, dtype=torch.float, device=device)
+    time_steps = rearrange(time_steps, 't -> 1 t 1')
+    ones = torch.ones_like(time_steps)
+    X = torch.cat([time_steps, ones], dim=-1) # 1 t 2
+
+    Xt = rearrange(X, 'b t d -> b d t')
+    XtX = Xt @ X
+    XtX_inv = torch.inverse(XtX)
+    X_pseudo_inv = XtX_inv @ Xt
+
+    coefficients = X_pseudo_inv @ traj
+    a, b = coefficients[:, 0, :], coefficients[:, 1, :]
+
+    t_next = t
+    pred = a * t_next + b
+
+    return pred
+
 
 class CNNEncoder(nn.Module):
     def __init__(self, in_channels=2, hidden_dim=128):
@@ -73,7 +125,7 @@ class AuroraForTyphoon(nn.Module):
         return out
 
 
-# Past trajectory and future local graph -> future trajectory
+'''Past trajectory and future local graph -> future trajectory'''
 class NeuralTrackerV1(nn.Module):
     def __init__(self, obs_len, pred_len, hidden_size=64):
         super().__init__()
@@ -120,12 +172,12 @@ class NeuralTrackerV1(nn.Module):
         return pred_traj
 
 
-# One coordinate and one global graph -> next coordinate
+'''One coordinate and one global graph -> next coordinate'''
 class NeuralTrackerV2(nn.Module):
     def __init__(self):
         super().__init__()
         self.traj_encoder = nn.Linear(2, 64)
-        self.atmos_encoder = FPN(block=Bottleneck, num_blocks=[2, 2, 2, 2])
+        self.atmos_encoder = FPN(block=Bottleneck, num_blocks=[2, 2, 2, 2], in_channels=2)
         self.traj_decoder = nn.Sequential(
             nn.Linear(64 + 256*4, 256),
             nn.ReLU(),
@@ -148,42 +200,12 @@ class NeuralTrackerV2(nn.Module):
         return out
 
 
-def crop_atmos(coords, atmos, delta=5.0):
-    B, C, H, W = atmos.shape
-    device = atmos.device
-
-    lat_res = 0.25
-    lon_res = 0.25
-    crop_size = int(2 * delta / lat_res)
-
-    lat_vals = torch.linspace(90, -90, H, device=device)
-    lon_vals = torch.linspace(0, 360 - lon_res, W, device=device)
-
-    lat_centers = coords[:, 0]
-    lon_centers = coords[:, 1]
-
-    lat_idx = torch.argmin(torch.abs(lat_vals[None, :] - lat_centers[:, None]), dim=1) # [B]
-    lon_idx = torch.argmin(torch.abs(lon_vals[None, :] - lon_centers[:, None]), dim=1) # [B]
-
-    offset = crop_size // 2
-
-    lat_indices = lat_idx[:, None] + torch.arange(-offset, -offset + crop_size, device=device) # [B, 40]
-    lon_indices = lon_idx[:, None] + torch.arange(-offset, -offset + crop_size, device=device) # [B, 40]
-
-    lat_idx_grid = lat_indices[:, None, :, None].expand(-1, C, -1, W) # [B, C, H_c, W]
-    lon_idx_grid = lon_indices[:, None, None, :].expand(-1, C, crop_size, -1) # [B, C, H_c, W_c]
-
-    cropped_atmos = torch.gather(atmos, dim=2, index=lat_idx_grid)
-    cropped_atmos = torch.gather(cropped_atmos, dim=3, index=lon_idx_grid)
-    return cropped_atmos
-
-
-# One coordinate and one surrounding graph -> next coordinate
+'''One coordinate and one surrounding graph -> next coordinate'''
 class NeuralTrackerV3(nn.Module):
     def __init__(self):
         super().__init__()
         self.traj_encoder = nn.Linear(2, 64)
-        self.atmos_encoder = FPN(block=Bottleneck, num_blocks=[2, 2, 2, 2])
+        self.atmos_encoder = FPN(block=Bottleneck, num_blocks=[2, 2, 2, 2], in_channels=2)
         self.traj_decoder = nn.Sequential(
             nn.Linear(64 + 256 * 4, 256),
             nn.ReLU(),
@@ -208,34 +230,13 @@ class NeuralTrackerV3(nn.Module):
         return out
 
 
-def linear_regression(traj):
-    b, t, d = traj.shape
-    device = traj.device
-
-    time_steps = torch.arange(t, dtype=torch.float, device=device)
-    time_steps = rearrange(time_steps, 't -> 1 t 1')
-    ones = torch.ones_like(time_steps)
-    X = torch.cat([time_steps, ones], dim=-1) # 1 t 2
-
-    Xt = rearrange(X, 'b t d -> b d t')
-    XtX = Xt @ X
-    XtX_inv = torch.inverse(XtX)
-    X_pseudo_inv = XtX_inv @ Xt
-
-    coefficients = X_pseudo_inv @ traj
-    a, b = coefficients[:, 0, :], coefficients[:, 1, :]
-
-    t_next = t
-    pred = a * t_next + b
-
-    return pred
-
-
+'''One linear extrapolated coordinate and one surrounding graph -> next coordinate'''
+# coordinate decoder: 1-layer MLP
 class NeuralTrackerV4(nn.Module):
     def __init__(self, traj_mean, traj_std):
         super().__init__()
         self.coord_encoder = nn.Linear(2, 64)
-        self.atmos_encoder = FPN(block=Bottleneck, num_blocks=[2, 2, 2, 2])
+        self.atmos_encoder = FPN(block=Bottleneck, num_blocks=[2, 2, 2, 2], in_channels=2)
         self.coord_decoder = nn.Linear(64 + 256 * 4, 2)
         self.register_buffer('traj_mean', traj_mean)
         self.register_buffer('traj_std', traj_std)
@@ -260,11 +261,12 @@ class NeuralTrackerV4(nn.Module):
         return out
 
 
+# coordinate decoder: 2-layer MLP
 class NeuralTrackerV5(nn.Module):
     def __init__(self, traj_mean, traj_std):
         super().__init__()
         self.coord_encoder = nn.Linear(2, 64)
-        self.atmos_encoder = FPN(block=Bottleneck, num_blocks=[2, 2, 2, 2])
+        self.atmos_encoder = FPN(block=Bottleneck, num_blocks=[2, 2, 2, 2], in_channels=2)
         self.coord_decoder = nn.Sequential(
             nn.Linear(64 + 256 * 4, 256),
             nn.ReLU(),

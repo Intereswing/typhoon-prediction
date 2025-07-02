@@ -1,6 +1,6 @@
-import datetime
 import os
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -43,7 +43,7 @@ def ddp_cleanup():
 
 def train(local_rank, world_size):
     data_dir = "/data1/jiyilun/typhoon"
-    model_name = "neural_tracker_v5"
+    model_name = "neural_tracker_v5.1"
     checkpoints_dir = Path("checkpoints") / model_name
     log_dir = Path("logs") / model_name
 
@@ -57,17 +57,21 @@ def train(local_rank, world_size):
         data_dir, 2011, 2020, 8, 12, with_era5=True
     )
     train_sampler = DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, batch_size=int(batch_size / world_size), sampler=train_sampler)
-
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=int(batch_size / world_size),
+        sampler=train_sampler,
+        shuffle=False,
+    )
     val_dataset = TyphoonTrajectoryDataset(
         data_dir, 2021, 2021, 8, 12, with_era5=True
     )
-    val_sampler = DistributedSampler(val_dataset)
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=int(batch_size / world_size),
-        shuffle=False,
         sampler=val_sampler,
+        shuffle=False,
     )
 
     # model and optimizer
@@ -95,7 +99,7 @@ def train(local_rank, world_size):
     num_step = num_epoch * len(train_dataloader)
 
     best_val_loss = float("inf")
-    num_patience = 10
+    num_patience = 100
     patience = num_patience
     should_stop = torch.tensor([0]).to(local_rank)
 
@@ -106,7 +110,11 @@ def train(local_rank, world_size):
         # Train
         train_sampler.set_epoch(epoch)
         ddp_model.train()
+        t0 = datetime.now()
         for obs_traj, gt_traj, pred_atmos in train_dataloader:
+            if local_rank == 0:
+                print(f"Loading data costs {(datetime.now() - t0).total_seconds()}s")
+            t0 = datetime.now()
             step += 1
 
             # obs_traj: [B, 8, 2]
@@ -130,6 +138,9 @@ def train(local_rank, world_size):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if local_rank == 0:
+                print(f"Train model costs {(datetime.now() - t0).total_seconds()}s")
+            t0 = datetime.now()
             if local_rank == 0 and step % print_per_step == 0:
                 logger.info(f"[Epoch {epoch+1}/{num_epoch}] | step {step}/{num_step} | train loss: {loss.item()}")
 
@@ -183,7 +194,7 @@ def train(local_rank, world_size):
                 patience = num_patience
                 torch.save(
                     {k: v for k, v in ddp_model.module.state_dict().items() if not k.startswith("aurora.")},
-                    checkpoints_dir / f"model_epoch_{epoch+1}.pt"
+                    checkpoints_dir / f"best_model.pt"
                 )
                 logger.info(f"Update model checkpoint in epoch {epoch+1}.")
             else:
@@ -206,9 +217,9 @@ def evaluate(local_rank):
     if local_rank == 0:
         print(f"Evaluate start!")
     data_dir = "/data1/jiyilun/typhoon"
-    model_name = "neural_tracker_v5"
+    model_name = "neural_tracker_v5.1"
     checkpoints_dir = Path("checkpoints") / model_name
-    checkpoint = torch.load(checkpoints_dir / "model_epoch_62.pt")
+    checkpoint = torch.load(checkpoints_dir / "model_epoch_99.pt")
 
     log_dir = Path("logs") / model_name
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -286,8 +297,8 @@ def evaluate(local_rank):
         for i in range(FDE.size(0)):
             logger.info(f"{(i+1)*6}h: {FDE[i].item():.2f} km.")
 
-        # with torch.inference_mode():
-        #     visualize_prediction(ddp_model, test_dataset, fig_dir, local_rank)
+        with torch.inference_mode():
+            visualize_prediction(ddp_model, test_dataset, fig_dir, local_rank)
 
 
 def visualize_prediction(model, dataset, fig_dir, device):
@@ -316,8 +327,8 @@ def visualize_prediction(model, dataset, fig_dir, device):
 def main():
     rank, local_rank, world_size = get_dist_info()
     ddp_setup(local_rank)
-    # train(local_rank, world_size)
-    evaluate(local_rank)
+    train(local_rank, world_size)
+    # evaluate(local_rank)
     ddp_cleanup()
 
 

@@ -95,9 +95,9 @@ class TyphoonTrajectoryDataset(Dataset):
             self.msl_std = 1.332246e03
 
         if self.with_era5:
-            # variable order: [msl]
-            self.era5_mean = torch.tensor([1.009578e05])
-            self.era5_std = torch.tensor([1.332246e03])
+            # variable order: [msl, z700]
+            self.era5_mean = torch.tensor([1.009578e05, 2.892882e04])
+            self.era5_std = torch.tensor([1.332246e03, 2.136436e03])
 
     def __len__(self):
         # 每一条台风对应 len - (lookback + horizon) + 1 条数据
@@ -150,15 +150,22 @@ class TyphoonTrajectoryDataset(Dataset):
 
                 elif self.with_era5:
                     ts = list(data_per_typhoon.keys())[idx + self.lookback: idx + self.lookback + self.horizon]
-                    variable_names = ["mean_sea_level_pressure"]
-                    era5_data = [xr.open_dataset(self.data_dir / "era5" / f"{t}.nc")[variable_names].to_array().values for t in ts]
-                    era5_data = np.stack(era5_data, axis=0) # [T, C, H, W]
-                    era5_data = torch.from_numpy(era5_data)
-
+                    variable_names = [
+                        'mean_sea_level_pressure',
+                        'geopotential'
+                    ]
+                    levels = [700]
+                    variable_data = [
+                        xr.open_dataset(self.data_dir / "era5" / f"{t}.nc")[variable_names].sel(level=levels).to_array().values
+                        for t in ts
+                    ]
+                    variable_data = np.stack(variable_data, axis=0) # t v h w l
+                    variable_data = torch.from_numpy(variable_data)
+                    variable_data = variable_data.squeeze(-1)
                     # normalize
-                    era5_data = (era5_data - self.era5_mean[..., None, None]) / self.era5_std[..., None, None]
+                    variable_data = (variable_data - self.era5_mean[..., None, None]) / self.era5_std[..., None, None]
 
-                    return trajectory[:self.lookback], trajectory[self.lookback:], era5_data
+                    return trajectory[:self.lookback], trajectory[self.lookback:], variable_data
 
         return None
 
@@ -330,5 +337,15 @@ class TyphoonTrajectoryDataset(Dataset):
 if __name__ == "__main__":
     ds_dir = "/data1/jiyilun/typhoon"
     # calculate mean and std
-    ds = TyphoonTrajectoryDataset(ds_dir, 2022, 2022, lookback=8, horizon=12, with_era5=True)
-    print(ds.get_typhoon_name(0))
+    ds = TyphoonTrajectoryDataset(ds_dir, 2011, 2020, lookback=8, horizon=12, with_era5=True)
+    nan_indices = []
+    for i in range(len(ds)):
+        _, _, era5_data = ds[i]
+        print(era5_data.shape)
+        if torch.isnan(era5_data).any():
+            print(f'index {i} has nan.')
+            nan_indices.append(i)
+        else:
+            print(f'index {i} is OK.')
+
+    print(f'Nan index: {nan_indices}')
